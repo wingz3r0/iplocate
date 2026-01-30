@@ -8,9 +8,11 @@ data, and writes results to an output CSV.
 import argparse
 import csv
 import ipaddress
+import json
 import os
 import sys
 import time
+import xml.etree.ElementTree as ET
 
 import geoip2.database
 import geoip2.errors
@@ -293,13 +295,111 @@ def rdap_lookup(ip_str, pause, max_retries=3):
     return result
 
 
+def _clean_row(row):
+    """Convert empty strings to None for JSON-based outputs."""
+    return {k: (None if v == "" else v) for k, v in row.items()}
+
+
+def write_csv(rows, out_fields, output_path):
+    """Write results as CSV."""
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=out_fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def write_json(rows, output_path):
+    """Write results as a JSON array."""
+    cleaned = [_clean_row(r) for r in rows]
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(cleaned, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def write_jsonl(rows, output_path):
+    """Write results as JSON Lines (one JSON object per line)."""
+    with open(output_path, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(_clean_row(row), ensure_ascii=False) + "\n")
+
+
+def write_geojson(rows, ip_col, output_path):
+    """Write results as a GeoJSON FeatureCollection with Point geometries."""
+    features = []
+    for row in rows:
+        props = _clean_row(row)
+        lat = row.get("geo_latitude", "")
+        lon = row.get("geo_longitude", "")
+        if lat != "" and lon != "":
+            try:
+                geometry = {
+                    "type": "Point",
+                    "coordinates": [float(lon), float(lat)],
+                }
+            except (ValueError, TypeError):
+                geometry = None
+        else:
+            geometry = None
+        features.append({
+            "type": "Feature",
+            "geometry": geometry,
+            "properties": props,
+        })
+    collection = {
+        "type": "FeatureCollection",
+        "features": features,
+    }
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(collection, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def write_kml(rows, ip_col, output_path):
+    """Write results as KML with Placemarks."""
+    kml_ns = "http://www.opengis.net/kml/2.2"
+    kml = ET.Element("kml", xmlns=kml_ns)
+    doc = ET.SubElement(kml, "Document")
+    name_el = ET.SubElement(doc, "name")
+    name_el.text = "IP Geolocation Results"
+
+    for row in rows:
+        pm = ET.SubElement(doc, "Placemark")
+        pm_name = ET.SubElement(pm, "name")
+        pm_name.text = row.get(ip_col, "unknown")
+
+        lat = row.get("geo_latitude", "")
+        lon = row.get("geo_longitude", "")
+        if lat != "" and lon != "":
+            try:
+                point = ET.SubElement(pm, "Point")
+                coords = ET.SubElement(point, "coordinates")
+                coords.text = f"{float(lon)},{float(lat)},0"
+            except (ValueError, TypeError):
+                pass
+
+        ext = ET.SubElement(pm, "ExtendedData")
+        for key, val in row.items():
+            if key in (ip_col, "geo_latitude", "geo_longitude"):
+                continue
+            data_el = ET.SubElement(ext, "Data", name=key)
+            val_el = ET.SubElement(data_el, "value")
+            val_el.text = str(val) if val != "" else ""
+
+    tree = ET.ElementTree(kml)
+    ET.indent(tree, space="  ")
+    tree.write(output_path, encoding="unicode", xml_declaration=True)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="IP Geolocation & Ownership Lookup Tool. "
                     "Enriches IPs from a CSV with GeoLite2 geolocation and RDAP ownership data."
     )
     parser.add_argument("-i", "--input", required=True, help="Input CSV file with IP addresses")
-    parser.add_argument("-o", "--output", required=True, help="Output CSV file path")
+    parser.add_argument("-o", "--output", required=True, help="Output file path")
+    parser.add_argument("-f", "--format", default="csv", choices=["csv", "json", "jsonl", "geojson", "kml"],
+                        help="Output format (default: csv)")
     parser.add_argument("-d", "--db", default=None, help="Path to GeoLite2-City.mmdb (auto-downloaded if omitted)")
     parser.add_argument("--asn-db", default=None, help="Path to GeoLite2-ASN.mmdb (auto-downloaded if omitted)")
     parser.add_argument("--ip-column", default=None, help="Name of IP column (auto-detected if omitted)")
@@ -352,61 +452,71 @@ def main():
                 out_fields += RDAP_COLUMNS
             out_fields.append("lookup_error")
 
-            # Process and write output
+            # Enrich all rows
+            enriched = []
             last_api_call = 0.0
-            with open(args.output, "w", newline="", encoding="utf-8") as outfile:
-                writer = csv.DictWriter(outfile, fieldnames=out_fields)
-                writer.writeheader()
+            for i, row in enumerate(rows, 1):
+                ip_str = row.get(ip_col, "").strip()
+                error = ""
 
-                for i, row in enumerate(rows, 1):
-                    ip_str = row.get(ip_col, "").strip()
-                    error = ""
-
-                    # Validate IP
-                    valid_ip = True
-                    if not ip_str:
-                        error = "empty IP"
+                # Validate IP
+                valid_ip = True
+                if not ip_str:
+                    error = "empty IP"
+                    valid_ip = False
+                else:
+                    try:
+                        ipaddress.ip_address(ip_str)
+                    except ValueError:
+                        error = f"invalid IP: {ip_str}"
                         valid_ip = False
-                    else:
-                        try:
-                            ipaddress.ip_address(ip_str)
-                        except ValueError:
-                            error = f"invalid IP: {ip_str}"
-                            valid_ip = False
 
-                    # Geo lookup
+                # Geo lookup
+                if valid_ip:
+                    geo = geo_lookup(city_reader, asn_reader, ip_str)
+                else:
+                    geo = {col: "" for col in GEO_COLUMNS}
+
+                # Refine with ip-api.com if GeoLite2 result is broad
+                if valid_ip and not args.no_refine and not is_private_ip(ip_str):
+                    radius = geo["geo_accuracy_radius_km"]
+                    needs_refine = (not geo["geo_city"]) or (radius and int(radius) >= 100)
+                    if needs_refine:
+                        geo, last_api_call = ip_api_refine(geo, ip_str, last_api_call)
+
+                row.update(geo)
+
+                # RDAP lookup
+                if not args.skip_rdap:
                     if valid_ip:
-                        geo = geo_lookup(city_reader, asn_reader, ip_str)
+                        rdap = rdap_lookup(ip_str, args.rdap_pause)
+                        if i < total:
+                            time.sleep(args.rdap_pause)
                     else:
-                        geo = {col: "" for col in GEO_COLUMNS}
+                        rdap = {col: "" for col in RDAP_COLUMNS}
+                    row.update(rdap)
 
-                    # Refine with ip-api.com if GeoLite2 result is broad
-                    if valid_ip and not args.no_refine and not is_private_ip(ip_str):
-                        radius = geo["geo_accuracy_radius_km"]
-                        needs_refine = (not geo["geo_city"]) or (radius and int(radius) >= 100)
-                        if needs_refine:
-                            geo, last_api_call = ip_api_refine(geo, ip_str, last_api_call)
+                row["lookup_error"] = error
+                enriched.append(row)
 
-                    row.update(geo)
+                status = "OK" if not error else error
+                label = ip_str if ip_str else "(empty)"
+                print(f"  [{i}/{total}] {label} - {status}", file=sys.stderr)
 
-                    # RDAP lookup
-                    if not args.skip_rdap:
-                        if valid_ip:
-                            rdap = rdap_lookup(ip_str, args.rdap_pause)
-                            if i < total:
-                                time.sleep(args.rdap_pause)
-                        else:
-                            rdap = {col: "" for col in RDAP_COLUMNS}
-                        row.update(rdap)
+            # Write output in selected format
+            fmt = args.format
+            if fmt == "csv":
+                write_csv(enriched, out_fields, args.output)
+            elif fmt == "json":
+                write_json(enriched, args.output)
+            elif fmt == "jsonl":
+                write_jsonl(enriched, args.output)
+            elif fmt == "geojson":
+                write_geojson(enriched, ip_col, args.output)
+            elif fmt == "kml":
+                write_kml(enriched, ip_col, args.output)
 
-                    row["lookup_error"] = error
-
-                    writer.writerow(row)
-                    status = "OK" if not error else error
-                    label = ip_str if ip_str else "(empty)"
-                    print(f"  [{i}/{total}] {label} - {status}", file=sys.stderr)
-
-        print(f"Done. Results written to {args.output}", file=sys.stderr)
+        print(f"Done. Results written to {args.output} ({fmt})", file=sys.stderr)
 
     finally:
         city_reader.close()
