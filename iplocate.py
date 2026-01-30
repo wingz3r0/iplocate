@@ -10,6 +10,7 @@ import csv
 import ipaddress
 import json
 import os
+import socket
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -56,6 +57,16 @@ RDAP_COLUMNS = [
     "rdap_abuse_email",
     "rdap_abuse_phone",
     "rdap_registry",
+]
+
+RDNS_COLUMNS = ["rdns_hostname"]
+
+ABUSE_COLUMNS = [
+    "abuse_score",
+    "abuse_reports",
+    "abuse_usage_type",
+    "abuse_is_tor",
+    "abuse_domain",
 ]
 
 IP_COLUMN_HINTS = {"ip", "ip_address", "ipaddress", "ip_addr", "ipaddr", "address", "src_ip", "dst_ip", "source_ip", "dest_ip"}
@@ -295,6 +306,57 @@ def rdap_lookup(ip_str, pause, max_retries=3):
     return result
 
 
+def rdns_lookup(ip_str):
+    """Perform reverse DNS lookup. Returns a dict with rdns_hostname."""
+    result = {"rdns_hostname": ""}
+    try:
+        hostname, _, _ = socket.gethostbyaddr(ip_str)
+        result["rdns_hostname"] = hostname
+    except (socket.herror, socket.gaierror, socket.timeout, OSError):
+        pass
+    return result
+
+
+def abuseipdb_lookup(ip_str, api_key, max_retries=3):
+    """Query AbuseIPDB v2 API for abuse data. Returns a dict of abuse columns."""
+    result = {col: "" for col in ABUSE_COLUMNS}
+
+    if is_private_ip(ip_str):
+        return result
+
+    url = f"https://api.abuseipdb.com/api/v2/check?ipAddress={ip_str}&maxAgeInDays=90"
+    headers = {
+        "Key": api_key,
+        "Accept": "application/json",
+    }
+
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code == 429:
+                wait = 2 ** (attempt + 1)
+                print(f"  AbuseIPDB rate limited, retrying in {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            result["abuse_score"] = data.get("abuseConfidenceScore", "")
+            result["abuse_reports"] = data.get("totalReports", "")
+            result["abuse_usage_type"] = data.get("usageType", "") or ""
+            result["abuse_is_tor"] = data.get("isTor", "")
+            result["abuse_domain"] = data.get("domain", "") or ""
+            return result
+        except requests.exceptions.HTTPError as e:
+            print(f"  AbuseIPDB error for {ip_str}: {e}", file=sys.stderr)
+            return result
+        except Exception as e:
+            print(f"  AbuseIPDB error for {ip_str}: {e}", file=sys.stderr)
+            return result
+
+    print(f"  AbuseIPDB failed after {max_retries} retries for {ip_str}", file=sys.stderr)
+    return result
+
+
 def _clean_row(row):
     """Convert empty strings to None for JSON-based outputs."""
     return {k: (None if v == "" else v) for k, v in row.items()}
@@ -393,6 +455,7 @@ def write_kml(rows, ip_col, output_path):
 
 # Friendly display labels for record-block text output
 _FIELD_LABELS = {
+    "rdns_hostname": "rDNS Hostname",
     "geo_country_code": "Country Code",
     "geo_country": "Country",
     "geo_region": "Region",
@@ -413,6 +476,11 @@ _FIELD_LABELS = {
     "rdap_abuse_email": "Abuse Email",
     "rdap_abuse_phone": "Abuse Phone",
     "rdap_registry": "Registry",
+    "abuse_score": "Abuse Score",
+    "abuse_reports": "Abuse Reports",
+    "abuse_usage_type": "Usage Type",
+    "abuse_is_tor": "Is Tor",
+    "abuse_domain": "Domain",
     "lookup_error": "Error",
 }
 
@@ -426,9 +494,10 @@ def write_txt(rows, ip_col, output_path):
             f.write(f"  {ip_str}\n")
             f.write(f"{'=' * 60}\n")
 
-            # Original columns (excluding IP)
+            # Original columns (excluding IP and enrichment columns)
             original_keys = [k for k in row if k not in GEO_COLUMNS
-                             and k not in RDAP_COLUMNS and k != "lookup_error"
+                             and k not in RDAP_COLUMNS and k not in RDNS_COLUMNS
+                             and k not in ABUSE_COLUMNS and k != "lookup_error"
                              and k != ip_col]
             if original_keys:
                 for key in original_keys:
@@ -436,6 +505,13 @@ def write_txt(rows, ip_col, output_path):
                     label = key.replace("_", " ").title()
                     if val != "":
                         f.write(f"  {label:<24} {val}\n")
+
+            # rDNS section
+            rdns_val = row.get("rdns_hostname", "")
+            if rdns_val:
+                f.write(f"\n  --- Reverse DNS ---\n")
+                label = _FIELD_LABELS.get("rdns_hostname", "rDNS Hostname")
+                f.write(f"  {label:<24} {rdns_val}\n")
 
             # Geo section
             geo_vals = {k: row.get(k, "") for k in GEO_COLUMNS}
@@ -452,6 +528,16 @@ def write_txt(rows, ip_col, output_path):
             if any(v != "" for v in rdap_vals.values()):
                 f.write(f"\n  --- RDAP Ownership ---\n")
                 for key in RDAP_COLUMNS:
+                    val = row.get(key, "")
+                    if val != "":
+                        label = _FIELD_LABELS.get(key, key)
+                        f.write(f"  {label:<24} {val}\n")
+
+            # Threat Intelligence section (AbuseIPDB)
+            abuse_vals = {k: row.get(k, "") for k in ABUSE_COLUMNS}
+            if any(v != "" for v in abuse_vals.values()):
+                f.write(f"\n  --- Threat Intelligence ---\n")
+                for key in ABUSE_COLUMNS:
                     val = row.get(key, "")
                     if val != "":
                         label = _FIELD_LABELS.get(key, key)
@@ -479,6 +565,9 @@ def parse_args():
     parser.add_argument("--ip-column", default=None, help="Name of IP column (auto-detected if omitted)")
     parser.add_argument("--rdap-pause", type=float, default=1.0, help="Seconds between RDAP lookups (default: 1.0)")
     parser.add_argument("--skip-rdap", action="store_true", help="Skip RDAP lookups (geo-only mode)")
+    parser.add_argument("--skip-rdns", action="store_true", help="Skip reverse DNS hostname lookups")
+    parser.add_argument("--abuseipdb-key", default=None, help="AbuseIPDB API key (enables threat checks)")
+    parser.add_argument("--dedupe", action="store_true", help="Skip lookups for duplicate IPs (use cached results)")
     parser.add_argument("--no-refine", action="store_true", help="Skip ip-api.com fallback for broad geolocations")
     parser.add_argument("--update-db", action="store_true", help="Force re-download of GeoLite2 databases")
     return parser.parse_args()
@@ -521,14 +610,21 @@ def main():
             print(f"Processing {total} rows...", file=sys.stderr)
 
             # Build output fieldnames
-            out_fields = list(fieldnames) + GEO_COLUMNS
+            out_fields = list(fieldnames)
+            if not args.skip_rdns:
+                out_fields += RDNS_COLUMNS
+            out_fields += GEO_COLUMNS
             if not args.skip_rdap:
                 out_fields += RDAP_COLUMNS
+            if args.abuseipdb_key:
+                out_fields += ABUSE_COLUMNS
             out_fields.append("lookup_error")
 
             # Enrich all rows
             enriched = []
             last_api_call = 0.0
+            cache = {}
+            cache_hits = 0
             for i, row in enumerate(rows, 1):
                 ip_str = row.get(ip_col, "").strip()
                 error = ""
@@ -545,6 +641,16 @@ def main():
                         error = f"invalid IP: {ip_str}"
                         valid_ip = False
 
+                # Check dedupe cache
+                if valid_ip and args.dedupe and ip_str in cache:
+                    row.update(cache[ip_str])
+                    row["lookup_error"] = error
+                    enriched.append(row)
+                    cache_hits += 1
+                    label = ip_str if ip_str else "(empty)"
+                    print(f"  [{i}/{total}] {label} - OK (cached)", file=sys.stderr)
+                    continue
+
                 # Geo lookup
                 if valid_ip:
                     geo = geo_lookup(city_reader, asn_reader, ip_str)
@@ -560,6 +666,14 @@ def main():
 
                 row.update(geo)
 
+                # rDNS lookup
+                if not args.skip_rdns:
+                    if valid_ip:
+                        rdns = rdns_lookup(ip_str)
+                    else:
+                        rdns = {col: "" for col in RDNS_COLUMNS}
+                    row.update(rdns)
+
                 # RDAP lookup
                 if not args.skip_rdap:
                     if valid_ip:
@@ -570,7 +684,32 @@ def main():
                         rdap = {col: "" for col in RDAP_COLUMNS}
                     row.update(rdap)
 
+                # AbuseIPDB lookup
+                if args.abuseipdb_key:
+                    if valid_ip:
+                        abuse = abuseipdb_lookup(ip_str, args.abuseipdb_key)
+                    else:
+                        abuse = {col: "" for col in ABUSE_COLUMNS}
+                    row.update(abuse)
+
                 row["lookup_error"] = error
+
+                # Store in dedupe cache
+                if valid_ip and args.dedupe:
+                    cached_fields = {}
+                    for col in GEO_COLUMNS:
+                        cached_fields[col] = row.get(col, "")
+                    if not args.skip_rdns:
+                        for col in RDNS_COLUMNS:
+                            cached_fields[col] = row.get(col, "")
+                    if not args.skip_rdap:
+                        for col in RDAP_COLUMNS:
+                            cached_fields[col] = row.get(col, "")
+                    if args.abuseipdb_key:
+                        for col in ABUSE_COLUMNS:
+                            cached_fields[col] = row.get(col, "")
+                    cache[ip_str] = cached_fields
+
                 enriched.append(row)
 
                 status = "OK" if not error else error
@@ -592,7 +731,11 @@ def main():
             elif fmt == "txt":
                 write_txt(enriched, ip_col, args.output)
 
-        print(f"Done. Results written to {args.output} ({fmt})", file=sys.stderr)
+        done_msg = f"Done. Results written to {args.output} ({fmt})"
+        if args.dedupe:
+            unique_count = len(cache)
+            done_msg += f" ({unique_count} unique IPs, {cache_hits} cached)"
+        print(done_msg, file=sys.stderr)
 
     finally:
         city_reader.close()
