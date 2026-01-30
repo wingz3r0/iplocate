@@ -391,6 +391,80 @@ def write_kml(rows, ip_col, output_path):
     tree.write(output_path, encoding="unicode", xml_declaration=True)
 
 
+# Friendly display labels for record-block text output
+_FIELD_LABELS = {
+    "geo_country_code": "Country Code",
+    "geo_country": "Country",
+    "geo_region": "Region",
+    "geo_city": "City",
+    "geo_latitude": "Latitude",
+    "geo_longitude": "Longitude",
+    "geo_accuracy_radius_km": "Accuracy Radius (km)",
+    "geo_postal_code": "Postal Code",
+    "geo_asn": "ASN",
+    "geo_asn_org": "ASN Org",
+    "rdap_asn": "RDAP ASN",
+    "rdap_asn_description": "RDAP ASN Description",
+    "rdap_asn_cidr": "RDAP ASN CIDR",
+    "rdap_network_name": "Network Name",
+    "rdap_network_cidr": "Network CIDR",
+    "rdap_network_country": "Network Country",
+    "rdap_org_name": "Org Name",
+    "rdap_abuse_email": "Abuse Email",
+    "rdap_abuse_phone": "Abuse Phone",
+    "rdap_registry": "Registry",
+    "lookup_error": "Error",
+}
+
+
+def write_txt(rows, ip_col, output_path):
+    """Write results as human-readable record blocks."""
+    with open(output_path, "w", encoding="utf-8") as f:
+        for idx, row in enumerate(rows):
+            ip_str = row.get(ip_col, "unknown")
+            f.write(f"{'=' * 60}\n")
+            f.write(f"  {ip_str}\n")
+            f.write(f"{'=' * 60}\n")
+
+            # Original columns (excluding IP)
+            original_keys = [k for k in row if k not in GEO_COLUMNS
+                             and k not in RDAP_COLUMNS and k != "lookup_error"
+                             and k != ip_col]
+            if original_keys:
+                for key in original_keys:
+                    val = row.get(key, "")
+                    label = key.replace("_", " ").title()
+                    if val != "":
+                        f.write(f"  {label:<24} {val}\n")
+
+            # Geo section
+            geo_vals = {k: row.get(k, "") for k in GEO_COLUMNS}
+            if any(v != "" for v in geo_vals.values()):
+                f.write(f"\n  --- Geolocation ---\n")
+                for key in GEO_COLUMNS:
+                    val = row.get(key, "")
+                    if val != "":
+                        label = _FIELD_LABELS.get(key, key)
+                        f.write(f"  {label:<24} {val}\n")
+
+            # RDAP section
+            rdap_vals = {k: row.get(k, "") for k in RDAP_COLUMNS}
+            if any(v != "" for v in rdap_vals.values()):
+                f.write(f"\n  --- RDAP Ownership ---\n")
+                for key in RDAP_COLUMNS:
+                    val = row.get(key, "")
+                    if val != "":
+                        label = _FIELD_LABELS.get(key, key)
+                        f.write(f"  {label:<24} {val}\n")
+
+            # Error
+            error = row.get("lookup_error", "")
+            if error:
+                f.write(f"\n  ** Error: {error}\n")
+
+            f.write("\n")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="IP Geolocation & Ownership Lookup Tool. "
@@ -398,7 +472,7 @@ def parse_args():
     )
     parser.add_argument("-i", "--input", required=True, help="Input CSV file with IP addresses")
     parser.add_argument("-o", "--output", required=True, help="Output file path")
-    parser.add_argument("-f", "--format", default="csv", choices=["csv", "json", "jsonl", "geojson", "kml"],
+    parser.add_argument("-f", "--format", default="csv", choices=["csv", "json", "jsonl", "geojson", "kml", "txt"],
                         help="Output format (default: csv)")
     parser.add_argument("-d", "--db", default=None, help="Path to GeoLite2-City.mmdb (auto-downloaded if omitted)")
     parser.add_argument("--asn-db", default=None, help="Path to GeoLite2-ASN.mmdb (auto-downloaded if omitted)")
@@ -515,6 +589,8 @@ def main():
                 write_geojson(enriched, ip_col, args.output)
             elif fmt == "kml":
                 write_kml(enriched, ip_col, args.output)
+            elif fmt == "txt":
+                write_txt(enriched, ip_col, args.output)
 
         print(f"Done. Results written to {args.output} ({fmt})", file=sys.stderr)
 
